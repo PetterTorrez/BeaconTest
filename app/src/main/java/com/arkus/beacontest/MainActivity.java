@@ -1,25 +1,26 @@
 package com.arkus.beacontest;
 
-import androidx.appcompat.app.AlertDialog;
-import androidx.appcompat.app.AppCompatActivity;
-import androidx.recyclerview.widget.LinearLayoutManager;
-import androidx.recyclerview.widget.RecyclerView;
-
 import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.inputmethodservice.Keyboard;
 import android.location.LocationManager;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.RemoteException;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.View;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.Toast;
+
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 
 import org.altbeacon.beacon.Beacon;
 import org.altbeacon.beacon.BeaconConsumer;
@@ -29,11 +30,18 @@ import org.altbeacon.beacon.Identifier;
 import org.altbeacon.beacon.RangeNotifier;
 import org.altbeacon.beacon.Region;
 import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.TestOnly;
 
+import java.io.File;
+import java.io.FileOutputStream;
+
+import java.io.IOException;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 
 public class MainActivity extends AppCompatActivity implements RangeNotifier, BeaconConsumer {
 
@@ -43,8 +51,26 @@ public class MainActivity extends AppCompatActivity implements RangeNotifier, Be
     private static final String IBEACON_GIMBAL1_LAYOUT = "m:0-3=ad7700c6";
     private static final String IBEACON_GIMBAL2_LAYOUT = "m:0-3=2d24bf16";
     private KalmanFilter kalmanFilter;
-    private final double PROCESS_NOISE = 0.001;
+    private final double PROCESS_NOISE = 0.33;
     private final double MEASUREMENT_NOISE = 2.847171;
+    /*
+     *   FEASY BEACON WORKS ~-66DB at 1 m (beacon at 100ms and 0dB power)
+     */
+    private final double MINIMAL_RISK_LOSS = 50;
+    private final int SAMPLES_PER_HISTOGRAM = 10;
+    private final double MINIMAL_RISK_DISTANCE =1;
+    private int sampleCounter=0;
+    private Map<Integer, Integer> histogram = new HashMap<>();
+    /*
+     * Enviroment loss constant depends on the application
+     * 2: For Free space
+     * 2.7 - 3.5 for Urban Areas
+     * 1.6 to 1.8 inside buildings (line of sight)
+     * 4 to 6 Obstructed building
+     * 2 to 3 Office (with many other devices operating at the same frequency)
+     */
+    private final double ENVIROMENT_LOSS_CONSTANT = 2;
+
 
     private RecyclerView recyclerView;
     private LogAdapter logAdapter;
@@ -56,6 +82,7 @@ public class MainActivity extends AppCompatActivity implements RangeNotifier, Be
 
     private Button mClear, mSave;
     private EditText mProcess, mMeasurement;
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -95,9 +122,33 @@ public class MainActivity extends AppCompatActivity implements RangeNotifier, Be
         });
 
         mSave.setOnClickListener(v -> {
-            kalmanFilter.setMeasurementNoise(Double.parseDouble(mMeasurement.getText().toString()));
-            kalmanFilter.setProcessNoise(Double.parseDouble(mProcess.getText().toString()));
-            Toast.makeText(this, "Valued Saved", Toast.LENGTH_SHORT).show();
+            //kalmanFilter.setMeasurementNoise(Double.parseDouble(mMeasurement.getText().toString()));
+            //kalmanFilter.setProcessNoise(Double.parseDouble(mProcess.getText().toString()));
+            //FileOutputStream stream = new FileOutputStream(file);
+            DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd-HH-mm-ss");
+            LocalDateTime now = LocalDateTime.now();
+            String d = dtf.format(now)+".csv";
+            File path = this.getBaseContext().getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);
+            File file = new File(path,d);
+            FileOutputStream stream = null;
+            try {
+                stream = new FileOutputStream(file);
+                for(int li=0; li != beaconLogs.size();li++) {
+                    try {
+                        stream.write(beaconLogs.get(li).getBytes());
+                        stream.write('\n');
+                    } catch (IOException e) {
+                    }
+                }
+                stream.close();
+            }catch(IOException e)
+            {
+
+            }
+            finally {
+
+            }
+            Toast.makeText(this, "Saved as"+file.getAbsolutePath(), Toast.LENGTH_SHORT).show();
             hideKeyboard();
         });
     }
@@ -119,8 +170,12 @@ public class MainActivity extends AppCompatActivity implements RangeNotifier, Be
                 List<BeaconParser> beaconParsers = beaconManager.getBeaconParsers();
                 beaconParsers.add(new BeaconParser().setBeaconLayout(IBEACON_UID_LAYOUT));
 
-                long scanPeriod = 100;
+                long scanPeriod = 0;
                 beaconManager.setForegroundBetweenScanPeriod(scanPeriod);
+                beaconManager.setForegroundScanPeriod(41); // Default, so this line not needed
+                beaconManager.setForegroundBetweenScanPeriod(0); // Default, so this line not needed
+                beaconManager.setBackgroundScanPeriod(41);
+                beaconManager.setBackgroundBetweenScanPeriod(1);
                 beaconManager.bind(this);
 
                 mIsRunning = true;
@@ -230,10 +285,32 @@ public class MainActivity extends AppCompatActivity implements RangeNotifier, Be
     @Override
     public void didRangeBeaconsInRegion(Collection<Beacon> beacons, Region region) {
         for (Beacon beacon: beacons) {
-            long rssiFiltered = Math.round(kalmanFilter.filter(beacon.getRssi()));
+
+            //long rssiFiltered = Math.round(kalmanFilter.filter(beacon.getRssi()));
             int rssi = beacon.getRssi();
-            String log = "Name: " + beacon.getBluetoothName() + " --- Current RSSI: " + rssi + " --- filtered RSSI: " + rssiFiltered
-                    + " --- distance: " +  String.format("%,.2f", Double.parseDouble(beacon.getDistance() + ""));
+            sampleCounter++;
+            Integer rssiBin = histogram.get(rssi);
+            if (rssiBin== null)
+                histogram.put(rssi,1);
+            else
+                histogram.put(rssi,rssiBin+1);
+
+            if (sampleCounter != SAMPLES_PER_HISTOGRAM) return;
+            int maxCount = 0;
+
+            for (Map.Entry<Integer, Integer> bin : histogram.entrySet()) {
+                if (bin.getValue() > maxCount) {
+                    maxCount = bin.getValue();
+                    rssi=bin.getKey();
+                }
+            }
+            sampleCounter=0;
+            histogram.clear();
+            //TODO include Xg which is the stochastic noise variable
+            double distance = MINIMAL_RISK_DISTANCE *
+                    Math.pow(10, (-MINIMAL_RISK_LOSS- rssi)/(10*ENVIROMENT_LOSS_CONSTANT));
+            String log = beacon.getBluetoothAddress() + "," + rssi + "," + distance;
+
             beaconLogs.add(log);
         }
 
